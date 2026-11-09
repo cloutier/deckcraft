@@ -258,6 +258,113 @@ fn presentation_changes_keep_the_workbook_byte_for_byte() {
     assert!(!xml.contains("Sheet1!"));
 }
 
+fn title_edit_with_literal_sources(fields: &[&str]) {
+    let (pptx, book) = imported_deck();
+    let mut chart = part(&pptx, "ppt/charts/chart1.xml").expect("chart");
+    for field in fields {
+        let open = format!("<c:{field}>");
+        let close = format!("</c:{field}>");
+        let mut start = 0;
+        let mut count = 0;
+        while let Some(offset) = chart[start..].find(&open) {
+            let a = start + offset;
+            let b = a + chart[a..].find(&close).expect("field end") + close.len();
+            let mut literal = chart[a..b].to_string();
+            if *field == "tx" {
+                // The chart title also has c:tx, but is rich text rather than a series name.
+                if !literal.contains("<c:strRef>") {
+                    start = b;
+                    continue;
+                }
+                let value_start = literal.find("<c:v>").expect("series name") + "<c:v>".len();
+                let value_end = value_start + literal[value_start..].find("</c:v>").expect("name end");
+                literal = format!("<c:tx><c:v>{}</c:v></c:tx>", &literal[value_start..value_end]);
+            } else {
+                let f_start = literal.find("<c:f>").expect("source formula");
+                let f_end = f_start + literal[f_start..].find("</c:f>").expect("formula end") + "</c:f>".len();
+                literal.replace_range(f_start..f_end, "");
+                for kind in ["str", "num"] {
+                    literal = literal.replace(&format!("<c:{kind}Ref>"), "").replace(&format!("</c:{kind}Ref>"), "");
+                    literal = literal.replace(&format!("{kind}Cache"), &format!("{kind}Lit"));
+                }
+            }
+            chart.replace_range(a..b, &literal);
+            start = a + literal.len();
+            count += 1;
+        }
+        assert_eq!(count, 3, "fixture must replace each series' {field}");
+    }
+    let pptx = replace(&pptx, "ppt/charts/chart1.xml", chart.as_bytes());
+    let (mut s, id) = session(&pptx);
+    s.execute("chart.options", &json!({"id": id, "title": "Renamed literal chart"})).expect("title");
+    let out = export(&s);
+    assert!(embedded(&out) == book, "title-only edit must preserve workbook bytes with literal {fields:?}");
+    let chart = part(&out, "ppt/charts/chart1.xml").expect("output chart");
+    assert!(chart.contains("Renamed literal chart"));
+    assert!(!chart.contains("<c:f></c:f>"), "literal data must not acquire an empty formula");
+    let reopened = deckcraft_pptx::import(&out).expect("reopen literal chart");
+    let chart = reopened
+        .slides
+        .iter()
+        .flat_map(|slide| &slide.shapes)
+        .find_map(|shape| match &shape.kind {
+            ShapeKind::Chart(chart) => Some(chart),
+            _ => None,
+        })
+        .expect("chart model");
+    assert_eq!(chart.categories, QS);
+    assert_eq!(chart.series.iter().map(|series| series.name.as_str()).collect::<Vec<_>>(), ["Series 1", "Series 2", "Series 3"]);
+    for (series, values) in chart.series.iter().zip([S1, S2, S3]) {
+        assert_eq!(series.values, values.iter().copied().map(Some).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn title_edit_preserves_workbook_with_literal_series_names() {
+    title_edit_with_literal_sources(&["tx"]);
+}
+
+#[test]
+fn title_edit_preserves_workbook_with_literal_categories() {
+    title_edit_with_literal_sources(&["cat"]);
+}
+
+#[test]
+fn title_edit_preserves_workbook_with_literal_values() {
+    title_edit_with_literal_sources(&["val"]);
+}
+
+#[test]
+fn title_edit_preserves_workbook_with_all_literal_data() {
+    title_edit_with_literal_sources(&["tx", "cat", "val"]);
+}
+
+#[test]
+fn older_native_chart_without_source_snapshot_keeps_raw_chart_and_workbook() {
+    let (pptx, book) = imported_deck();
+    let xml = part(&pptx, "ppt/charts/chart1.xml").expect("chart").replace(
+        "</c:chartSpace>",
+        r#"<c:extLst><c:ext uri="urn:deckcraft:test:old-native-source"><owned:marker xmlns:owned="urn:deckcraft:test:owned" value="keep"/></c:ext></c:extLst></c:chartSpace>"#,
+    );
+    let pptx = replace(&pptx, "ppt/charts/chart1.xml", xml.as_bytes());
+    let mut presentation = deckcraft_pptx::import(&pptx).expect("import");
+    let slide = Arc::make_mut(presentation.slides.first_mut().expect("slide"));
+    let chart = slide
+        .shapes
+        .iter_mut()
+        .find_map(|shape| match &mut shape.kind {
+            ShapeKind::Chart(chart) => Some(chart),
+            _ => None,
+        })
+        .expect("chart model");
+    assert!(chart.source.is_some());
+    // Old native files deserialize the newly added optional snapshot as None.
+    chart.source = None;
+    let out = deckcraft_pptx::export(&presentation).expect("export old native model");
+    assert!(embedded(&out) == book, "absence of nonsemantic source metadata must not regenerate an unchanged workbook");
+    assert_eq!(part(&out, "ppt/charts/chart1.xml").expect("raw chart"), xml);
+}
+
 #[test]
 fn a_changed_value_rewrites_only_its_cell() {
     let (pptx, book) = imported_deck();
@@ -291,6 +398,41 @@ fn a_renamed_series_renames_its_table_column() {
     let table = part(&out, "xl/tables/table1.xml").expect("table");
     assert_eq!(table, part(&book, "xl/tables/table1.xml").expect("table").replace(r#"name="Series 2""#, r#"name="Costs &amp; fees""#));
     assert_eq!(part(&out, "xl/sharedStrings.xml"), part(&book, "xl/sharedStrings.xml"));
+}
+
+#[test]
+fn edited_numeric_categories_keep_numeric_cells() {
+    let (pptx, book) = imported_deck();
+    let chart = part(&pptx, "ppt/charts/chart1.xml").expect("chart");
+    let mut numeric_chart = chart.clone();
+    let mut start = 0;
+    while let Some(offset) = numeric_chart[start..].find("<c:cat>") {
+        let a = start + offset;
+        let b = a + numeric_chart[a..].find("</c:cat>").expect("category end") + "</c:cat>".len();
+        let mut category = numeric_chart[a..b].replace("strRef", "numRef").replace("strCache", "numCache");
+        for (old, new) in [("Q1", "45000"), ("Q2", "45001"), ("Q3", "45002"), ("Q4", "45003")] {
+            category = category.replace(old, new);
+        }
+        numeric_chart.replace_range(a..b, &category);
+        start = a + category.len();
+    }
+    assert!(numeric_chart.contains("<c:cat><c:numRef>"), "fixture must use numeric category references");
+    let mut sheet = part(&book, SHEET).expect("sheet");
+    for index in 0..4 {
+        sheet = sheet.replace(
+            &format!(r#"<c r="A{}" t="s"><v>{}</v></c>"#, index + 2, index + 4),
+            &format!(r#"<c r="A{}" s="1"><v>{}</v></c>"#, index + 2, 45000 + index),
+        );
+    }
+    assert!(sheet.contains(r#"<c r="A2" s="1"><v>45000</v></c>"#), "fixture must start with numeric categories");
+    let book = replace(&book, SHEET, sheet.as_bytes());
+    let pptx = replace(&pptx, "ppt/charts/chart1.xml", numeric_chart.as_bytes());
+    let pptx = replace(&pptx, "ppt/embeddings/workbook1.xlsx", &book);
+    let (mut s, id) = session(&pptx);
+    data(&mut s, id, &["45004", "45001", "45002", "45003"], &[("Series 1", S1), ("Series 2", S2), ("Series 3", S3)]);
+    let out = embedded(&export(&s));
+    let sheet = part(&out, SHEET).expect("sheet");
+    assert!(sheet.contains(r#"<c r="A2" s="1"><v>45004</v></c>"#), "numeric category must retain its numeric type and style: {sheet}");
 }
 
 #[test]
